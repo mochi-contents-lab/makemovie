@@ -1,23 +1,31 @@
 ﻿# =========================================================================
-# GitHub Issue → ComfyUI → Video → GitHub Pages 自動処理
+# GitHub Issue → ComfyUI → Video → GitHub Pages
+# 常駐自動処理版
 #
-# Workflow:
+# 動作:
 #
-#   workflows\minimax_h3.json
+#   1. GitHubのOpen Issueを5分ごとに確認
+#   2. Issue本文をComfyUIプロンプトとして使用
+#   3. Workflow JSON内の __TARGET_PROMPT__ を置換
+#   4. RandomNoiseのSeedを毎回ランダム化
+#   5. ComfyUIへジョブ送信
+#   6. Prompt IDをIssueへ即座に記録
+#   7. 最大60分、5分間隔で生成完了を確認
+#   8. 動画をdocs/videosへコピー
+#   9. docs/index.html更新
+#  10. Git commit / push
+#  11. 成功したらIssueをClose
+#  12. 5分待機して次のIssue確認
 #
-# Workflow JSONではプロンプト部分だけ、
-#
-#   "__TARGET_PROMPT__"
-#
-# としてください。
-#
-# Seedは通常の数値でOK。
-# RandomNoiseノードのnoise_seedを自動ランダム化します。
+# Ctrl+C で終了
 #
 # =========================================================================
 
 param(
-    [string]$WorkflowJson = ".\workflows\video_minimax_h3_t2v.json"
+    [string]$WorkflowJson = ".\workflows\video_minimax_h3_t2v.json",
+
+    # GitHub確認間隔
+    [int]$LoopIntervalSeconds = 300
 )
 
 # =========================================================================
@@ -32,25 +40,27 @@ $ComfyPromptUrl  = "$ComfyUrl/prompt"
 $ComfyHistoryUrl = "$ComfyUrl/history"
 $ComfySystemUrl  = "$ComfyUrl/system_stats"
 
+# ComfyUIの実際の動画出力先
 $ComfyOutputDir = "F:\aiimg\StabilityMatrix\Data\Images\Text2Img\video"
 
+# GitHub Pages
 $RepoVideoDir = "docs\videos"
 $PagesFile = "docs\index.html"
 
+# 1回のGitHub確認で取得するIssue数
 $IssueLimit = 10
 
-# 5分間隔
+# ComfyUI生成確認間隔
 $CheckIntervalSeconds = 300
 
-# 最大60分
+# ComfyUI生成最大待機時間
 $MaxWaitSeconds = 3600
 
+# Workflow JSONのプロンプト置換文字列
 $PromptPlaceholder = "__TARGET_PROMPT__"
 
-# 成功済みマーカー
+# Issueコメントマーカー
 $SuccessMarker = "[COMFYUI-AUTO-COMPLETED]"
-
-# ジョブ登録マーカー
 $JobMarker = "[COMFYUI-AUTO-JOB]"
 
 # =========================================================================
@@ -166,7 +176,7 @@ function Get-IssueComments {
 }
 
 # =========================================================================
-# 既存ジョブ情報をコメントから取得
+# 既存ジョブ情報取得
 # =========================================================================
 
 function Get-ExistingJobInfo {
@@ -174,7 +184,8 @@ function Get-ExistingJobInfo {
         [int]$IssueNumber
     )
 
-    $comments = Get-IssueComments -IssueNumber $IssueNumber
+    $comments = Get-IssueComments `
+        -IssueNumber $IssueNumber
 
     $result = [PSCustomObject]@{
         Completed = $false
@@ -187,16 +198,26 @@ function Get-ExistingJobInfo {
 
         $body = [string]$comment.body
 
-        if ($body -like "*$SuccessMarker*") {
+        # -------------------------------------------------------------
+        # 完了済み
+        #
+        # -like は [] をワイルドカードとして扱うため使用しない。
+        # -------------------------------------------------------------
+
+        if ($body.Contains($SuccessMarker)) {
 
             $result.Completed = $true
         }
 
-        if ($body -like "*$JobMarker*") {
+        # -------------------------------------------------------------
+        # ジョブ情報
+        # -------------------------------------------------------------
+
+        if ($body.Contains($JobMarker)) {
 
             $match = [regex]::Match(
                 $body,
-                'Prompt ID:\s*([a-f0-9\-]+)',
+                'Prompt ID:\s*([^\s]+)',
                 [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
             )
 
@@ -360,6 +381,7 @@ function Replace-PromptPlaceholder {
                 if ($Object[$i] -eq $PromptPlaceholder) {
 
                     $Object[$i] = $PromptText
+
                     $ReplacementCount.Value++
                 }
             }
@@ -384,6 +406,7 @@ function Replace-PromptPlaceholder {
                 if ($property.Value -eq $PromptPlaceholder) {
 
                     $property.Value = $PromptText
+
                     $ReplacementCount.Value++
                 }
             }
@@ -399,7 +422,7 @@ function Replace-PromptPlaceholder {
 }
 
 # =========================================================================
-# Seed変更
+# RandomNoise Seed設定
 # =========================================================================
 
 function Set-RandomSeed {
@@ -423,13 +446,18 @@ function Set-RandomSeed {
 
             if ([string]$node.class_type -eq "RandomNoise") {
 
-                if ($node.inputs.PSObject.Properties.Name -contains "noise_seed") {
+                if (
+                    $node.inputs.PSObject.Properties.Name `
+                    -contains "noise_seed"
+                ) {
 
                     $node.inputs.noise_seed = $Seed
 
                     $found = $true
 
-                    Write-Host "RandomNoise Seed: $Seed" -ForegroundColor DarkGray
+                    Write-Host `
+                        "RandomNoise Seed: $Seed" `
+                        -ForegroundColor DarkGray
                 }
             }
         }
@@ -437,12 +465,12 @@ function Set-RandomSeed {
 
     if (!$found) {
 
-        throw "RandomNoiseノードが見つかりません。"
+        throw "Workflow JSON内にRandomNoiseノードが見つかりません。"
     }
 }
 
 # =========================================================================
-# ComfyUI History
+# ComfyUI History取得
 # =========================================================================
 
 function Get-ComfyHistory {
@@ -476,7 +504,10 @@ function Get-VideoOutputFromHistory {
         return $null
     }
 
-    if ($History.PSObject.Properties.Name -notcontains "outputs") {
+    if (
+        $History.PSObject.Properties.Name `
+        -notcontains "outputs"
+    ) {
         return $null
     }
 
@@ -490,7 +521,10 @@ function Get-VideoOutputFromHistory {
 
         foreach ($outputName in @("videos", "images")) {
 
-            if ($nodeOutput.PSObject.Properties.Name -contains $outputName) {
+            if (
+                $nodeOutput.PSObject.Properties.Name `
+                -contains $outputName
+            ) {
 
                 foreach ($item in @($nodeOutput.$outputName)) {
 
@@ -523,7 +557,7 @@ function Get-VideoOutputFromHistory {
 }
 
 # =========================================================================
-# 動画をローカルから探す
+# ローカル動画検索
 # =========================================================================
 
 function Find-LocalVideo {
@@ -532,9 +566,11 @@ function Find-LocalVideo {
     )
 
     if ([string]::IsNullOrWhiteSpace($FileName)) {
+
         return $null
     }
 
+    # まず直下を確認
     $directPath = Join-Path `
         $ComfyOutputDir `
         $FileName
@@ -571,7 +607,7 @@ function Copy-ComfyVideo {
 
     $fileName = $null
 
-    if ($VideoOutput -ne $null) {
+    if ($null -ne $VideoOutput) {
 
         $fileName = [System.IO.Path]::GetFileName(
             $VideoOutput.Filename
@@ -593,7 +629,17 @@ function Copy-ComfyVideo {
 
     if ($null -eq $localVideo) {
 
-        throw "ComfyUI出力フォルダに動画が見つかりません: $fileName"
+        throw `
+            "ComfyUI出力フォルダに動画が見つかりません: $fileName"
+    }
+
+    if (!(Test-Path -LiteralPath $RepoVideoDir)) {
+
+        New-Item `
+            -ItemType Directory `
+            -Path $RepoVideoDir `
+            -Force |
+            Out-Null
     }
 
     $target = Join-Path `
@@ -605,13 +651,15 @@ function Copy-ComfyVideo {
         -Destination $target `
         -Force
 
-    $targetInfo = Get-Item -LiteralPath $target
+    $targetInfo = Get-Item `
+        -LiteralPath $target
 
     if ($targetInfo.Length -le 0) {
 
         throw "コピーされた動画が0バイトです。"
     }
 
+    Write-Host ""
     Write-Host "動画コピー完了:" -ForegroundColor Green
     Write-Host $target -ForegroundColor Green
 
@@ -619,7 +667,7 @@ function Copy-ComfyVideo {
 }
 
 # =========================================================================
-# index.html作成・更新
+# GitHub Pages更新
 # =========================================================================
 
 function Update-Pages {
@@ -651,17 +699,24 @@ function Update-Pages {
             Out-Null
     }
 
+    # -------------------------------------------------------------
+    # index.html初回作成
+    # -------------------------------------------------------------
+
     if (!(Test-Path -LiteralPath $PagesFile)) {
 
         $initialHtml = @"
 <!DOCTYPE html>
 <html lang="ja">
 <head>
+
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
 <title>MiniMax H3 動画生成ジョブ履歴</title>
 
 <style>
+
 body {
     font-family: sans-serif;
     max-width: 800px;
@@ -717,6 +772,7 @@ video {
     margin-top: 15px;
     background: #000;
 }
+
 </style>
 
 </head>
@@ -739,6 +795,10 @@ video {
         )
     }
 
+    # -------------------------------------------------------------
+    # index.html読み込み
+    # -------------------------------------------------------------
+
     $html = [System.IO.File]::ReadAllText(
         $PagesFile,
         $Utf8NoBom
@@ -748,6 +808,10 @@ video {
 
         throw "index.htmlにJOBS_STARTがありません。"
     }
+
+    # -------------------------------------------------------------
+    # HTMLエスケープ
+    # -------------------------------------------------------------
 
     $safePrompt = [System.Net.WebUtility]::HtmlEncode(
         $PromptText
@@ -766,6 +830,10 @@ video {
     )
 
     $date = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+    # -------------------------------------------------------------
+    # 新しいジョブ
+    # -------------------------------------------------------------
 
     $newJob = @"
 <div class="job-card">
@@ -793,6 +861,10 @@ $safeVideoName
 </div>
 "@
 
+    # -------------------------------------------------------------
+    # JOBS_START直後へ追加
+    # -------------------------------------------------------------
+
     $html = $html.Replace(
         "<!-- JOBS_START -->",
         "<!-- JOBS_START -->`r`n$newJob"
@@ -804,7 +876,9 @@ $safeVideoName
         $Utf8NoBom
     )
 
-    Write-Host "GitHub Pages更新完了。" -ForegroundColor Green
+    Write-Host `
+        "GitHub Pagesのindex.htmlを更新しました。" `
+        -ForegroundColor Green
 }
 
 # =========================================================================
@@ -814,7 +888,13 @@ $safeVideoName
 function Publish-Docs {
 
     Write-Host ""
-    Write-Host "GitHub Pagesへ成果物をプッシュします..." -ForegroundColor Cyan
+    Write-Host `
+        "GitHub Pagesへ成果物をプッシュします..." `
+        -ForegroundColor Cyan
+
+    # -------------------------------------------------------------
+    # docs追加
+    # -------------------------------------------------------------
 
     git add -- docs/
 
@@ -823,32 +903,24 @@ function Publish-Docs {
         throw "git addに失敗しました。"
     }
 
+    # -------------------------------------------------------------
+    # 変更確認
+    # -------------------------------------------------------------
+
     git diff --cached --quiet
 
     if ($LASTEXITCODE -eq 0) {
 
-        Write-Host "docs/に新しい変更はありません。" -ForegroundColor Yellow
-
-        # すでにpush済みなら成功扱い
-        git fetch origin main
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "git fetchに失敗しました。"
-        }
-
-        $ahead = git rev-list --count origin/main..HEAD
-
-        if ([int]$ahead -gt 0) {
-
-            git push origin main
-
-            if ($LASTEXITCODE -ne 0) {
-                throw "git pushに失敗しました。"
-            }
-        }
+        Write-Host `
+            "docs/に新しい変更はありません。" `
+            -ForegroundColor Yellow
 
         return
     }
+
+    # -------------------------------------------------------------
+    # Commit
+    # -------------------------------------------------------------
 
     git commit `
         -m "Auto-update Pages [skip ci]"
@@ -858,6 +930,10 @@ function Publish-Docs {
         throw "git commitに失敗しました。"
     }
 
+    # -------------------------------------------------------------
+    # Push
+    # -------------------------------------------------------------
+
     git push origin main
 
     if ($LASTEXITCODE -ne 0) {
@@ -865,37 +941,575 @@ function Publish-Docs {
         throw "git pushに失敗しました。"
     }
 
-    Write-Host "GitHubへのpush完了。" -ForegroundColor Green
+    Write-Host `
+        "GitHubへのpush完了。" `
+        -ForegroundColor Green
 }
 
 # =========================================================================
-# 事前チェック
+# Workflow読み込み
 # =========================================================================
 
-Write-Section "GitHub Issue → ComfyUI 自動動画生成"
+function Load-Workflow {
 
-Write-Host "Workflow: $WorkflowJson" -ForegroundColor DarkGray
+    if (!(Test-Path -LiteralPath $WorkflowJson)) {
 
-if (!(Test-Path -LiteralPath $WorkflowJson)) {
+        throw "Workflow JSONがありません: $WorkflowJson"
+    }
 
-    Write-Error "Workflow JSONがありません:"
-    Write-Error $WorkflowJson
-    exit 1
-}
+    $workflowText = [System.IO.File]::ReadAllText(
+        (Resolve-Path $WorkflowJson),
+        $Utf8NoBom
+    )
 
-if (!(Test-Path -LiteralPath $ComfyOutputDir)) {
+    $workflow = $workflowText | ConvertFrom-Json
 
-    Write-Error "ComfyUI出力フォルダがありません:"
-    Write-Error $ComfyOutputDir
-    exit 1
+    return [PSCustomObject]@{
+        Text = $workflowText
+        Object = $workflow
+    }
 }
 
 # =========================================================================
-# ComfyUI接続確認
+# Workflow placeholder確認
+# =========================================================================
+
+function Test-WorkflowPlaceholder {
+    param(
+        $Workflow
+    )
+
+    $script:placeholderCount = 0
+
+    function Count-Placeholder {
+        param(
+            $Object
+        )
+
+        if ($null -eq $Object) {
+            return
+        }
+
+        if ($Object -is [System.Collections.IList]) {
+
+            foreach ($item in $Object) {
+
+                if ($item -is [string]) {
+
+                    if ($item -eq $PromptPlaceholder) {
+
+                        $script:placeholderCount++
+                    }
+                }
+                else {
+
+                    Count-Placeholder $item
+                }
+            }
+
+            return
+        }
+
+        if ($Object -is [PSCustomObject]) {
+
+            foreach ($property in $Object.PSObject.Properties) {
+
+                if ($property.Value -is [string]) {
+
+                    if ($property.Value -eq $PromptPlaceholder) {
+
+                        $script:placeholderCount++
+                    }
+                }
+                else {
+
+                    Count-Placeholder $property.Value
+                }
+            }
+        }
+    }
+
+    Count-Placeholder $Workflow
+
+    $count = $script:placeholderCount
+
+    $script:placeholderCount = 0
+
+    if ($count -ne 1) {
+
+        throw `
+            "Workflow JSON内の $PromptPlaceholder が1個ではありません。現在: $count"
+    }
+
+    Write-Host `
+        "Workflow placeholder OK" `
+        -ForegroundColor Green
+}
+
+# =========================================================================
+# Issueを1件処理
+# =========================================================================
+
+function Process-Issue {
+    param(
+        $Issue,
+
+        $BaseWorkflow
+    )
+
+    $issueNumber = [int]$Issue.number
+
+    Write-Host ""
+    Write-Host `
+        "----------------------------------------" `
+        -ForegroundColor Gray
+
+    Write-Host `
+        "Processing Issue #$issueNumber : $($Issue.title)" `
+        -ForegroundColor Magenta
+
+    Write-Host `
+        "----------------------------------------" `
+        -ForegroundColor Gray
+
+    # -------------------------------------------------------------
+    # 既存ジョブ確認
+    # -------------------------------------------------------------
+
+    $existingJob = Get-ExistingJobInfo `
+        -IssueNumber $issueNumber
+
+    # -------------------------------------------------------------
+    # 完了済み
+    # -------------------------------------------------------------
+
+    if ($existingJob.Completed) {
+
+        Write-Host `
+            "このIssueは既に処理完了しています。" `
+            -ForegroundColor Green
+
+        Write-Host `
+            "二重処理防止のためスキップします。" `
+            -ForegroundColor Yellow
+
+        return
+    }
+
+    # -------------------------------------------------------------
+    # Prompt
+    # -------------------------------------------------------------
+
+    $promptText = [string]$Issue.body
+
+    if ([string]::IsNullOrWhiteSpace($promptText)) {
+
+        $promptText = [string]$Issue.title
+    }
+
+    $promptText = $promptText.Trim()
+
+    Write-Host ""
+    Write-Host `
+        "抽出されたプロンプト:" `
+        -ForegroundColor DarkGray
+
+    Write-Host `
+        $promptText `
+        -ForegroundColor White
+
+    $promptId = $existingJob.PromptId
+    $videoFileName = $existingJob.VideoFileName
+
+    # -------------------------------------------------------------
+    # 新規ジョブ
+    # -------------------------------------------------------------
+
+    if ([string]::IsNullOrWhiteSpace($promptId)) {
+
+        Write-Host ""
+        Write-Host `
+            "新規ComfyUIジョブを作成します。" `
+            -ForegroundColor Cyan
+
+        # ---------------------------------------------------------
+        # Workflowコピー
+        # ---------------------------------------------------------
+
+        $workflow = $BaseWorkflow.Text | ConvertFrom-Json
+
+        # ---------------------------------------------------------
+        # Prompt置換
+        # ---------------------------------------------------------
+
+        $replacementCount = 0
+
+        Replace-PromptPlaceholder `
+            -Object $workflow `
+            -PromptText $promptText `
+            -ReplacementCount ([ref]$replacementCount)
+
+        if ($replacementCount -ne 1) {
+
+            throw `
+                "Prompt placeholderの置換に失敗しました。"
+        }
+
+        # ---------------------------------------------------------
+        # Random Seed
+        # ---------------------------------------------------------
+
+        $seed = [Int64](
+            Get-Random `
+                -Minimum 1 `
+                -Maximum 2147483647
+        )
+
+        Set-RandomSeed `
+            -Workflow $workflow `
+            -Seed $seed
+
+        # ---------------------------------------------------------
+        # Payload
+        # ---------------------------------------------------------
+
+        $payloadObject = @{
+            prompt = $workflow
+        }
+
+        $payload = $payloadObject |
+            ConvertTo-Json `
+                -Depth 100 `
+                -Compress
+
+        $payloadBytes = $Utf8NoBom.GetBytes(
+            $payload
+        )
+
+        # ---------------------------------------------------------
+        # ComfyUI送信
+        # ---------------------------------------------------------
+
+        Write-Host ""
+        Write-Host `
+            "ComfyUI ジョブを送信中..." `
+            -ForegroundColor Cyan
+
+        $response = Invoke-RestMethod `
+            -Uri $ComfyPromptUrl `
+            -Method Post `
+            -Body $payloadBytes `
+            -ContentType "application/json; charset=utf-8" `
+            -ErrorAction Stop
+
+        if ($null -eq $response.prompt_id) {
+
+            throw `
+                "ComfyUIからPrompt IDが返されませんでした。"
+        }
+
+        $promptId = [string]$response.prompt_id
+
+        Write-Host `
+            "ジョブ送信成功！" `
+            -ForegroundColor Green
+
+        Write-Host `
+            "Prompt ID: $promptId" `
+            -ForegroundColor Yellow
+
+        # ---------------------------------------------------------
+        # ★重要
+        #
+        # Prompt IDを即座にIssueへ保存
+        #
+        # この後Git等が失敗しても、
+        # 次回ループでは再送信しない。
+        # ---------------------------------------------------------
+
+        Add-JobComment `
+            -IssueNumber $issueNumber `
+            -PromptId $promptId `
+            -Seed $seed
+
+        Write-Host `
+            "Prompt IDをIssueへ記録しました。" `
+            -ForegroundColor Green
+    }
+    else {
+
+        Write-Host ""
+        Write-Host `
+            "既存のComfyUIジョブを検出しました。" `
+            -ForegroundColor Yellow
+
+        Write-Host `
+            "Prompt ID: $promptId" `
+            -ForegroundColor Yellow
+
+        Write-Host `
+            "ComfyUIへの再送信は行いません。" `
+            -ForegroundColor Green
+    }
+
+    # -------------------------------------------------------------
+    # 動画生成待機
+    # -------------------------------------------------------------
+
+    Write-Host ""
+    Write-Host `
+        "動画生成を最大60分待機します。" `
+        -ForegroundColor Cyan
+
+    Write-Host `
+        "5分ごとにComfyUIを確認します。" `
+        -ForegroundColor DarkGray
+
+    $startTime = Get-Date
+
+    $videoOutput = $null
+
+    while ($true) {
+
+        $elapsed = (
+            (Get-Date) - $startTime
+        ).TotalSeconds
+
+        $minutes = [math]::Floor(
+            $elapsed / 60
+        )
+
+        Write-Host ""
+
+        Write-Host `
+            "[$minutes 分経過] ComfyUIの生成状態を確認中..." `
+            -ForegroundColor Cyan
+
+        $historyResponse = Get-ComfyHistory `
+            -PromptId $promptId
+
+        if ($null -ne $historyResponse) {
+
+            if (
+                $historyResponse.PSObject.Properties.Name `
+                -contains $promptId
+            ) {
+
+                $history = $historyResponse.$promptId
+
+                # -------------------------------------------------
+                # エラー確認
+                # -------------------------------------------------
+
+                if (
+                    $history.PSObject.Properties.Name `
+                    -contains "status"
+                ) {
+
+                    if (
+                        $history.status.PSObject.Properties.Name `
+                        -contains "status_str"
+                    ) {
+
+                        $status = [string]$history.status.status_str
+
+                        Write-Host `
+                            "Status: $status" `
+                            -ForegroundColor DarkGray
+
+                        if (
+                            $status -match `
+                            '(?i)error|failed'
+                        ) {
+
+                            throw `
+                                "ComfyUIジョブが失敗しました。Status=$status"
+                        }
+                    }
+                }
+
+                # -------------------------------------------------
+                # 動画確認
+                # -------------------------------------------------
+
+                $videoOutput = Get-VideoOutputFromHistory `
+                    -History $history
+
+                if ($null -ne $videoOutput) {
+
+                    Write-Host ""
+                    Write-Host `
+                        "動画生成完了！" `
+                        -ForegroundColor Green
+
+                    break
+                }
+            }
+        }
+
+        # -------------------------------------------------------------
+        # タイムアウト
+        # -------------------------------------------------------------
+
+        if ($elapsed -ge $MaxWaitSeconds) {
+
+            throw `
+                "最大待機時間60分を超えました。"
+        }
+
+        Write-Host `
+            "まだ生成中です。5分後に再確認します。" `
+            -ForegroundColor DarkGray
+
+        Start-Sleep `
+            -Seconds $CheckIntervalSeconds
+    }
+
+    # -------------------------------------------------------------
+    # 動画ファイル名
+    # -------------------------------------------------------------
+
+    if ($null -ne $videoOutput) {
+
+        $videoFileName = [System.IO.Path]::GetFileName(
+            $videoOutput.Filename
+        )
+
+        Write-Host ""
+        Write-Host `
+            "生成された動画:" `
+            -ForegroundColor Green
+
+        Write-Host `
+            "  Filename : $videoFileName"
+
+        Write-Host `
+            "  Subfolder: $($videoOutput.Subfolder)"
+
+        Write-Host `
+            "  Type     : $($videoOutput.Type)"
+    }
+
+    # -------------------------------------------------------------
+    # 動画コピー
+    # -------------------------------------------------------------
+
+    $videoFileName = Copy-ComfyVideo `
+        -VideoOutput $videoOutput `
+        -KnownFileName $videoFileName
+
+    # -------------------------------------------------------------
+    # GitHub Pages更新
+    # -------------------------------------------------------------
+
+    Update-Pages `
+        -IssueNumber $issueNumber `
+        -PromptText $promptText `
+        -PromptId $promptId `
+        -VideoFileName $videoFileName
+
+    # -------------------------------------------------------------
+    # Git commit / push
+    # -------------------------------------------------------------
+
+    Publish-Docs
+
+    # -------------------------------------------------------------
+    # 完了コメント
+    # -------------------------------------------------------------
+
+    Add-CompletedComment `
+        -IssueNumber $issueNumber `
+        -PromptId $promptId `
+        -VideoFileName $videoFileName
+
+    # -------------------------------------------------------------
+    # Issue Close
+    # -------------------------------------------------------------
+
+    Close-Issue `
+        -IssueNumber $issueNumber `
+        -PromptId $promptId `
+        -VideoFileName $videoFileName
+
+    Write-Host ""
+    Write-Host `
+        "Issue #$issueNumber 完了！" `
+        -ForegroundColor Green
+
+    Write-Host `
+        "Prompt ID: $promptId" `
+        -ForegroundColor Green
+
+    Write-Host `
+        "Video: $videoFileName" `
+        -ForegroundColor Green
+}
+
+# =========================================================================
+# 起動
+# =========================================================================
+
+Write-Section `
+    "GitHub Issue → ComfyUI → Video → GitHub Pages 常駐自動処理"
+
+Write-Host ""
+Write-Host `
+    "Workflow : $WorkflowJson" `
+    -ForegroundColor DarkGray
+
+Write-Host `
+    "Issue確認: $LoopIntervalSeconds 秒ごと" `
+    -ForegroundColor DarkGray
+
+Write-Host `
+    "生成待機 : 最大60分" `
+    -ForegroundColor DarkGray
+
+Write-Host ""
+Write-Host `
+    "Ctrl+C で終了します。" `
+    -ForegroundColor Yellow
+
+# =========================================================================
+# 初期チェック
 # =========================================================================
 
 Write-Host ""
-Write-Host "ComfyUIの接続を確認しています..." -ForegroundColor Cyan
+Write-Host `
+    "初期チェック中..." `
+    -ForegroundColor Cyan
+
+# -------------------------------------------------------------
+# Workflow
+# -------------------------------------------------------------
+
+if (!(Test-Path -LiteralPath $WorkflowJson)) {
+
+    Write-Error `
+        "Workflow JSONがありません: $WorkflowJson"
+
+    exit 1
+}
+
+# -------------------------------------------------------------
+# ComfyUI出力
+# -------------------------------------------------------------
+
+if (!(Test-Path -LiteralPath $ComfyOutputDir)) {
+
+    Write-Error `
+        "ComfyUI出力フォルダがありません:"
+
+    Write-Error `
+        $ComfyOutputDir
+
+    exit 1
+}
+
+# -------------------------------------------------------------
+# ComfyUI接続
+# -------------------------------------------------------------
 
 try {
 
@@ -905,430 +1519,258 @@ try {
         -ErrorAction Stop |
         Out-Null
 
-    Write-Host "ComfyUI 接続OK" -ForegroundColor Green
+    Write-Host `
+        "ComfyUI 接続OK" `
+        -ForegroundColor Green
 }
 catch {
 
-    Write-Error "ComfyUIに接続できません: $ComfyUrl"
+    Write-Error `
+        "ComfyUIに接続できません: $ComfyUrl"
+
     exit 1
 }
 
-# =========================================================================
+# -------------------------------------------------------------
 # Workflow読み込み
-# =========================================================================
+# -------------------------------------------------------------
 
 try {
 
-    $workflowText = [System.IO.File]::ReadAllText(
-        (Resolve-Path $WorkflowJson),
-        $Utf8NoBom
-    )
+    $BaseWorkflow = Load-Workflow
 
-    $baseWorkflow = $workflowText | ConvertFrom-Json
+    Test-WorkflowPlaceholder `
+        -Workflow $BaseWorkflow.Object
 }
 catch {
 
-    Write-Error "Workflow JSON読み込み失敗: $_"
+    Write-Error $_
+
     exit 1
 }
 
-# =========================================================================
-# Placeholder確認
-# =========================================================================
-
-$placeholderCount = 0
-
-function Count-Placeholder {
-    param(
-        $Object
-    )
-
-    if ($null -eq $Object) {
-        return
-    }
-
-    if ($Object -is [System.Collections.IList]) {
-
-        foreach ($item in $Object) {
-
-            if ($item -is [string]) {
-
-                if ($item -eq $PromptPlaceholder) {
-                    $script:placeholderCount++
-                }
-            }
-            else {
-                Count-Placeholder $item
-            }
-        }
-
-        return
-    }
-
-    if ($Object -is [PSCustomObject]) {
-
-        foreach ($property in $Object.PSObject.Properties) {
-
-            if ($property.Value -is [string]) {
-
-                if ($property.Value -eq $PromptPlaceholder) {
-                    $script:placeholderCount++
-                }
-            }
-            else {
-                Count-Placeholder $property.Value
-            }
-        }
-    }
-}
-
-Count-Placeholder $baseWorkflow
-
-if ($placeholderCount -ne 1) {
-
-    Write-Error "Workflow JSON内の $PromptPlaceholder が1個ではありません。現在: $placeholderCount"
-    exit 1
-}
-
-Write-Host "Prompt placeholder OK" -ForegroundColor Green
-
-# =========================================================================
-# Issue取得
-# =========================================================================
-
-Write-Section "GitHubから未処理Issue取得"
+# -------------------------------------------------------------
+# Git確認
+# -------------------------------------------------------------
 
 try {
 
-    $issueJson = Invoke-GhJson @(
-        "issue",
-        "list",
-        "--repo",
-        $GithubRepo,
-        "--state",
-        "open",
-        "--limit",
-        "$IssueLimit",
-        "--json",
-        "number,title,body"
-    )
+    $gitName = git config user.name
+    $gitEmail = git config user.email
 
-    $issues = @(
-        $issueJson | ConvertFrom-Json
-    )
+    if (
+        [string]::IsNullOrWhiteSpace($gitName) -or
+        [string]::IsNullOrWhiteSpace($gitEmail)
+    ) {
+
+        throw `
+            "Git user.name / user.email が設定されていません。"
+    }
+
+    Write-Host `
+        "Git user: $gitName <$gitEmail>" `
+        -ForegroundColor DarkGray
 }
 catch {
 
-    Write-Error "Issue取得失敗: $_"
+    Write-Error $_
+
     exit 1
 }
 
-if ($issues.Count -eq 0) {
+# -------------------------------------------------------------
+# GitHub CLI確認
+# -------------------------------------------------------------
 
-    Write-Host "処理対象のIssueはありません。" -ForegroundColor Green
-    exit 0
+try {
+
+    $null = & gh auth status 2>&1
+
+    if ($LASTEXITCODE -ne 0) {
+
+        throw "GitHub CLIの認証状態を確認できません。"
+    }
+
+    Write-Host `
+        "GitHub CLI 接続OK" `
+        -ForegroundColor Green
+}
+catch {
+
+    Write-Error $_
+
+    exit 1
 }
 
-Write-Host "$($issues.Count) 件のIssueを処理します。" -ForegroundColor Cyan
+Write-Host ""
+Write-Host `
+    "初期チェック完了。" `
+    -ForegroundColor Green
 
 # =========================================================================
-# Issue処理
+# 常駐ループ
 # =========================================================================
 
-foreach ($issue in $issues) {
-
-    Write-Host ""
-    Write-Host "----------------------------------------" -ForegroundColor Gray
-    Write-Host "Processing Issue #$($issue.number): $($issue.title)" -ForegroundColor Magenta
-    Write-Host "----------------------------------------" -ForegroundColor Gray
+while ($true) {
 
     try {
 
+        Write-Section `
+            "GitHub Issue確認"
+
+        Write-Host `
+            "Open Issueを確認しています..." `
+            -ForegroundColor Cyan
+
         # -------------------------------------------------------------
-        # Issueの既存ジョブ情報
+        # Issue取得
         # -------------------------------------------------------------
 
-        $existingJob = Get-ExistingJobInfo `
-            -IssueNumber ([int]$issue.number)
+        $issueJson = Invoke-GhJson @(
+            "issue",
+            "list",
+            "--repo",
+            $GithubRepo,
+            "--state",
+            "open",
+            "--limit",
+            "$IssueLimit",
+            "--json",
+            "number,title,body"
+        )
+
+        $issues = @(
+            $issueJson | ConvertFrom-Json
+        )
 
         # -------------------------------------------------------------
-        # すでに完了している場合
+        # Issueなし
         # -------------------------------------------------------------
 
-        if ($existingJob.Completed) {
+        if ($issues.Count -eq 0) {
 
-            Write-Host "このIssueは既に処理完了しています。" -ForegroundColor Green
-            Write-Host "二重処理を防止するためスキップします。" -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host `
+                "処理対象のOpen Issueはありません。" `
+                -ForegroundColor Green
+
+            Write-Host ""
+            Write-Host `
+                "次回確認まで $LoopIntervalSeconds 秒待機します。" `
+                -ForegroundColor DarkGray
+
+            Start-Sleep `
+                -Seconds $LoopIntervalSeconds
 
             continue
         }
 
         # -------------------------------------------------------------
-        # Prompt
-        # -------------------------------------------------------------
-
-        $promptText = $issue.body
-
-        if ([string]::IsNullOrWhiteSpace($promptText)) {
-
-            $promptText = $issue.title
-        }
-
-        $promptText = $promptText.Trim()
-
-        Write-Host "抽出されたプロンプト:" -ForegroundColor DarkGray
-        Write-Host $promptText -ForegroundColor White
-
-        $promptId = $existingJob.PromptId
-        $videoFileName = $existingJob.VideoFileName
-
-        # -------------------------------------------------------------
-        # 既存ジョブがない場合だけComfyUIへ送信
-        # -------------------------------------------------------------
-
-        if ([string]::IsNullOrWhiteSpace($promptId)) {
-
-            Write-Host ""
-            Write-Host "新規ComfyUIジョブを作成します。" -ForegroundColor Cyan
-
-            $workflow = $workflowText | ConvertFrom-Json
-
-            # Prompt
-            $replacementCount = 0
-
-            Replace-PromptPlaceholder `
-                -Object $workflow `
-                -PromptText $promptText `
-                -ReplacementCount ([ref]$replacementCount)
-
-            if ($replacementCount -ne 1) {
-
-                throw "Prompt placeholderの置換に失敗しました。"
-            }
-
-            # Seed
-            $seed = [Int64](
-                Get-Random `
-                    -Minimum 1 `
-                    -Maximum 2147483647
-            )
-
-            Set-RandomSeed `
-                -Workflow $workflow `
-                -Seed $seed
-
-            # Payload
-            $payloadObject = @{
-                prompt = $workflow
-            }
-
-            $payload = $payloadObject |
-                ConvertTo-Json `
-                    -Depth 100 `
-                    -Compress
-
-            $payloadBytes = $Utf8NoBom.GetBytes($payload)
-
-            # Send
-            Write-Host "ComfyUI ジョブを送信中..." -ForegroundColor Cyan
-
-            $response = Invoke-RestMethod `
-                -Uri $ComfyPromptUrl `
-                -Method Post `
-                -Body $payloadBytes `
-                -ContentType "application/json; charset=utf-8" `
-                -ErrorAction Stop
-
-            if ($null -eq $response.prompt_id) {
-
-                throw "Prompt IDが返されませんでした。"
-            }
-
-            $promptId = [string]$response.prompt_id
-
-            Write-Host "ジョブ送信成功！" -ForegroundColor Green
-            Write-Host "Prompt ID: $promptId" -ForegroundColor Yellow
-
-            # ---------------------------------------------------------
-            # ★ここが重要
-            # Prompt IDを即座にIssueへ保存
-            # ---------------------------------------------------------
-
-            Add-JobComment `
-                -IssueNumber ([int]$issue.number) `
-                -PromptId $promptId `
-                -Seed $seed
-
-            Write-Host "Prompt IDをIssueへ記録しました。" -ForegroundColor Green
-        }
-        else {
-
-            Write-Host ""
-            Write-Host "既存のComfyUIジョブを検出しました。" -ForegroundColor Yellow
-            Write-Host "Prompt ID: $promptId" -ForegroundColor Yellow
-            Write-Host "ComfyUIへ再送信しません。" -ForegroundColor Green
-        }
-
-        # -------------------------------------------------------------
-        # History確認
+        # Issueあり
         # -------------------------------------------------------------
 
         Write-Host ""
-        Write-Host "動画生成状態を確認します。" -ForegroundColor Cyan
+        Write-Host `
+            "$($issues.Count) 件のOpen Issueを検出しました。" `
+            -ForegroundColor Cyan
 
-        $startTime = Get-Date
+        # -------------------------------------------------------------
+        # Issueを順番に処理
+        # -------------------------------------------------------------
 
-        $videoOutput = $null
+        foreach ($issue in $issues) {
 
-        while ($true) {
+            try {
 
-            $elapsed = (
-                (Get-Date) - $startTime
-            ).TotalSeconds
-
-            $minutes = [math]::Floor(
-                $elapsed / 60
-            )
-
-            Write-Host ""
-            Write-Host "[$minutes 分経過] ComfyUIの生成状態を確認中..." -ForegroundColor Cyan
-
-            $historyResponse = Get-ComfyHistory `
-                -PromptId $promptId
-
-            if ($null -ne $historyResponse) {
-
-                if (
-                    $historyResponse.PSObject.Properties.Name `
-                    -contains $promptId
-                ) {
-
-                    $history = $historyResponse.$promptId
-
-                    # エラー確認
-                    if ($history.PSObject.Properties.Name -contains "status") {
-
-                        if (
-                            $history.status.PSObject.Properties.Name `
-                            -contains "status_str"
-                        ) {
-
-                            $status = [string]$history.status.status_str
-
-                            Write-Host "Status: $status" -ForegroundColor DarkGray
-
-                            if (
-                                $status -match
-                                '(?i)error|failed'
-                            ) {
-
-                                throw "ComfyUIジョブが失敗しました。Status=$status"
-                            }
-                        }
-                    }
-
-                    $videoOutput = Get-VideoOutputFromHistory `
-                        -History $history
-
-                    if ($null -ne $videoOutput) {
-
-                        Write-Host "動画生成完了！" -ForegroundColor Green
-
-                        break
-                    }
-                }
+                Process-Issue `
+                    -Issue $issue `
+                    -BaseWorkflow $BaseWorkflow
             }
+            catch {
 
-            if ($elapsed -ge $MaxWaitSeconds) {
+                Write-Host ""
+                Write-Host `
+                    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" `
+                    -ForegroundColor Red
 
-                throw "最大待機時間60分を超えました。"
+                Write-Host `
+                    "Issue #$($issue.number) の処理に失敗しました。" `
+                    -ForegroundColor Red
+
+                Write-Host ""
+                Write-Host `
+                    $_ `
+                    -ForegroundColor Red
+
+                Write-Host ""
+                Write-Host `
+                    "Issueはクローズしません。" `
+                    -ForegroundColor Yellow
+
+                Write-Host `
+                    "次回ループで再確認します。" `
+                    -ForegroundColor Yellow
+
+                Write-Host `
+                    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" `
+                    -ForegroundColor Red
+
+                # -----------------------------------------------------
+                # 1件失敗しても次のIssueへ進む
+                # -----------------------------------------------------
+
+                continue
             }
-
-            Write-Host "まだ生成中です。5分後に再確認します。" -ForegroundColor DarkGray
-
-            Start-Sleep `
-                -Seconds $CheckIntervalSeconds
         }
 
         # -------------------------------------------------------------
-        # 動画ファイル名
+        # 今回のチェック終了
         # -------------------------------------------------------------
-
-        if ($null -ne $videoOutput) {
-
-            $videoFileName = [System.IO.Path]::GetFileName(
-                $videoOutput.Filename
-            )
-
-            Write-Host ""
-            Write-Host "生成された動画:" -ForegroundColor Green
-            Write-Host "  Filename : $videoFileName"
-            Write-Host "  Subfolder: $($videoOutput.Subfolder)"
-            Write-Host "  Type     : $($videoOutput.Type)"
-        }
-
-        # -------------------------------------------------------------
-        # 動画コピー
-        # -------------------------------------------------------------
-
-        $videoFileName = Copy-ComfyVideo `
-            -VideoOutput $videoOutput `
-            -KnownFileName $videoFileName
-
-        # -------------------------------------------------------------
-        # Pages
-        # -------------------------------------------------------------
-
-        Update-Pages `
-            -IssueNumber ([int]$issue.number) `
-            -PromptText $promptText `
-            -PromptId $promptId `
-            -VideoFileName $videoFileName
-
-        # -------------------------------------------------------------
-        # Git
-        # -------------------------------------------------------------
-
-        Publish-Docs
-
-        # -------------------------------------------------------------
-        # 完了コメント
-        # -------------------------------------------------------------
-
-        Add-CompletedComment `
-            -IssueNumber ([int]$issue.number) `
-            -PromptId $promptId `
-            -VideoFileName $videoFileName
-
-        # -------------------------------------------------------------
-        # Close
-        # -------------------------------------------------------------
-
-        Close-Issue `
-            -IssueNumber ([int]$issue.number) `
-            -PromptId $promptId `
-            -VideoFileName $videoFileName
 
         Write-Host ""
-        Write-Host "Issue #$($issue.number) 完了！" -ForegroundColor Green
-        Write-Host "Prompt ID: $promptId" -ForegroundColor Green
-        Write-Host "Video: $videoFileName" -ForegroundColor Green
+        Write-Host `
+            "今回のIssueチェックが終了しました。" `
+            -ForegroundColor Green
+
+        Write-Host ""
+        Write-Host `
+            "次回GitHub確認まで $LoopIntervalSeconds 秒待機します。" `
+            -ForegroundColor DarkGray
+
+        Start-Sleep `
+            -Seconds $LoopIntervalSeconds
     }
     catch {
 
-        Write-Host ""
-        Write-Host "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" -ForegroundColor Red
-        Write-Host "Issue #$($issue.number) の処理に失敗しました。" -ForegroundColor Red
-        Write-Host $_ -ForegroundColor Red
-        Write-Host "Issueはクローズしません。" -ForegroundColor Yellow
-        Write-Host "次回実行時には既存ジョブを確認します。" -ForegroundColor Yellow
-        Write-Host "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" -ForegroundColor Red
+        # =============================================================
+        # GitHub / ネットワーク等のメインループエラー
+        # =============================================================
 
-        continue
+        Write-Host ""
+        Write-Host `
+            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" `
+            -ForegroundColor Red
+
+        Write-Host `
+            "メインループでエラーが発生しました。" `
+            -ForegroundColor Red
+
+        Write-Host ""
+        Write-Host `
+            $_ `
+            -ForegroundColor Red
+
+        Write-Host ""
+        Write-Host `
+            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" `
+            -ForegroundColor Red
+
+        Write-Host ""
+        Write-Host `
+            "$LoopIntervalSeconds 秒後に再試行します。" `
+            -ForegroundColor Yellow
+
+        Start-Sleep `
+            -Seconds $LoopIntervalSeconds
     }
 }
-
-Write-Host ""
-Write-Host "========================================" -ForegroundColor Green
-Write-Host "すべてのIssue処理が終了しました。" -ForegroundColor Green
-Write-Host "========================================" -ForegroundColor Green
