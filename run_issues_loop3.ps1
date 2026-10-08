@@ -1,39 +1,19 @@
 ﻿# =========================================================================
-# GitHub Issue → ComfyUI → Video → GitHub Pages
+# GitHub Issue -> ComfyUI -> Video -> GitHub Pages
 # 常駐自動処理
 #
-# 完全復旧版
+# 完全復旧版 + git出力混入バグ修正版
 #
-# 特徴:
+# 修正ポイント:
 #
-#   1. GitHub Open Issueを定期確認
-#   2. Issue本文をComfyUIプロンプトとして使用
-#   3. Workflow JSON内の __TARGET_PROMPT__ を置換
-#   4. RandomNoise noise_seedを毎ジョブランダム化
-#   5. ComfyUIへジョブ送信
-#   6. ComfyUI Prompt IDを即座にローカル状態へ永続保存
-#   7. GitHubコメント保存に失敗してもPrompt IDを失わない
-#   8. 再起動しても状態JSONから復旧
-#   9. ComfyUIへの二重送信を防止
-#  10. 最大60分、5分間隔で生成確認
-#  11. ComfyUI Historyから動画を特定
-#  12. docs/videosへ動画コピー
-#  13. docs/index.html更新
-#  14. Git commit / push
-#  15. 各工程を個別に状態管理
-#  16. 途中失敗しても次回は続きから再開
-#  17. 成功したらIssueへ完了コメント
-#  18. IssueをClose
-#
-# 重要:
-#
-#   ComfyUIへのPOST成功後にPrompt IDを取得した時点で、
-#   ローカルStateへ即座に保存する。
-#
-#   その後GitHub / Git / Pages等が失敗しても
-#   ComfyUIジョブを再送信しない。
-#
-# Ctrl+Cで終了
+#   1. Publish-Docs の git 出力が $State に混入しないように修正
+#   2. Ensure-GitPublished で $null = Publish-Docs を使用
+#   3. Ensure-Completed で $State が配列化していても防御
+#   4. 状態ファイルに CompletedCommented / Closed が無い場合は自動補完
+#   5. 完了コメントが既に存在する場合は重複投稿しない
+#   6. Jobコメントが既に存在する場合は重複投稿しない
+#   7. Issue が既に close されている場合は Closed=true として扱う
+#   8. ComfyUI History の Prompt ID 参照を安全化
 #
 # =========================================================================
 
@@ -122,11 +102,7 @@ function Ensure-StateDirectory {
 
     if (!(Test-Path -LiteralPath $StateDir)) {
 
-        New-Item `
-            -ItemType Directory `
-            -Path $StateDir `
-            -Force |
-            Out-Null
+        New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
     }
 }
 
@@ -141,9 +117,67 @@ function Get-StatePath {
 
     Ensure-StateDirectory
 
-    return Join-Path `
-        $StateDir `
-        "issue-$IssueNumber.json"
+    return Join-Path -Path $StateDir -ChildPath "issue-$IssueNumber.json"
+}
+
+# =========================================================================
+# Stateプロパティ補完
+#
+# 古いStateファイルや、途中で壊れたStateファイルに対して
+# 必要なプロパティを自動で追加する。
+# =========================================================================
+
+function Ensure-StateProperties {
+    param(
+        [Parameter(Mandatory = $true)]
+        $State
+    )
+
+    if ($null -eq $State) {
+        return
+    }
+
+    $defaults = [ordered]@{
+        Version = 2
+
+        IssueNumber = 0
+        Title = ""
+        Prompt = ""
+
+        CreatedAt = $null
+        UpdatedAt = $null
+
+        PromptId = $null
+        Seed = $null
+
+        Submitted = $false
+        JobCommented = $false
+
+        Generated = $false
+
+        VideoFileName = $null
+        VideoSubfolder = $null
+
+        VideoCopied = $false
+
+        PagesUpdated = $false
+
+        GitPublished = $false
+
+        CompletedCommented = $false
+        Closed = $false
+
+        LastError = $null
+        LastErrorAt = $null
+    }
+
+    foreach ($name in $defaults.Keys) {
+
+        if (-not ($State.PSObject.Properties.Name -contains $name)) {
+
+            $State | Add-Member -NotePropertyName $name -NotePropertyValue $defaults[$name] -Force
+        }
+    }
 }
 
 # =========================================================================
@@ -222,20 +256,41 @@ function Save-State {
         $State
     )
 
+    # -------------------------------------------------------------
+    # 保険:
+    #
+    # 過去バグで $State が配列になっている場合がある。
+    # 配列なら PSCustomObject だけを取り出す。
+    # -------------------------------------------------------------
+
+    if ($State -is [array]) {
+
+        $State =
+            $State |
+            Where-Object {
+                $_ -is [pscustomobject]
+            } |
+            Select-Object -First 1
+    }
+
+    if ($null -eq $State) {
+
+        throw "Save-State: Stateがnullです。"
+    }
+
+    Ensure-StateProperties $State
+
     Ensure-StateDirectory
 
     $issueNumber = [int]$State.IssueNumber
 
-    $path = Get-StatePath `
-        -IssueNumber $issueNumber
+    $path = Get-StatePath -IssueNumber $issueNumber
 
     $tempPath = "$path.tmp"
 
     $State.UpdatedAt = (Get-Date).ToString("o")
 
-    $json = $State |
-        ConvertTo-Json `
-            -Depth 20
+    $json = $State | ConvertTo-Json -Depth 20
 
     [System.IO.File]::WriteAllText(
         $tempPath,
@@ -243,10 +298,7 @@ function Save-State {
         $Utf8NoBom
     )
 
-    Move-Item `
-        -LiteralPath $tempPath `
-        -Destination $path `
-        -Force
+    Move-Item -LiteralPath $tempPath -Destination $path -Force
 }
 
 # =========================================================================
@@ -258,8 +310,7 @@ function Load-State {
         [int]$IssueNumber
     )
 
-    $path = Get-StatePath `
-        -IssueNumber $IssueNumber
+    $path = Get-StatePath -IssueNumber $IssueNumber
 
     if (!(Test-Path -LiteralPath $path)) {
 
@@ -273,12 +324,15 @@ function Load-State {
             $Utf8NoBom
         )
 
-        return $json | ConvertFrom-Json
+        $state = $json | ConvertFrom-Json
+
+        Ensure-StateProperties $state
+
+        return $state
     }
     catch {
 
-        throw `
-            "Stateファイルを読み込めません: $path`n$_"
+        throw "Stateファイルを読み込めません: $path`n$_"
     }
 }
 
@@ -437,14 +491,11 @@ function Get-GitHubJobInfo {
 
     try {
 
-        $comments = Get-IssueComments `
-            -IssueNumber $IssueNumber
+        $comments = Get-IssueComments -IssueNumber $IssueNumber
     }
     catch {
 
-        Write-Host `
-            "GitHubコメント取得に失敗しました。" `
-            -ForegroundColor Yellow
+        Write-Host "GitHubコメント取得に失敗しました。" -ForegroundColor Yellow
 
         return $result
     }
@@ -472,8 +523,7 @@ function Get-GitHubJobInfo {
 
             if ($match.Success) {
 
-                $result.PromptId =
-                    $match.Groups[1].Value
+                $result.PromptId = $match.Groups[1].Value
             }
 
             $match = [regex]::Match(
@@ -484,8 +534,7 @@ function Get-GitHubJobInfo {
 
             if ($match.Success) {
 
-                $result.VideoFileName =
-                    $match.Groups[1].Value
+                $result.VideoFileName = $match.Groups[1].Value
             }
 
             $match = [regex]::Match(
@@ -496,8 +545,7 @@ function Get-GitHubJobInfo {
 
             if ($match.Success) {
 
-                $result.Seed =
-                    $match.Groups[1].Value
+                $result.Seed = $match.Groups[1].Value
             }
         }
     }
@@ -533,15 +581,11 @@ Seed: $Seed
 次回実行時にはPrompt IDを使用して再送信を防止します。
 "@
 
-    $result = & gh issue comment `
-        "$IssueNumber" `
-        --repo $GithubRepo `
-        --body $comment 2>&1
+    $result = & gh issue comment "$IssueNumber" --repo $GithubRepo --body $comment 2>&1
 
     if ($LASTEXITCODE -ne 0) {
 
-        throw `
-            "Issueへのジョブ情報記録に失敗しました: $result"
+        throw "Issueへのジョブ情報記録に失敗しました: $result"
     }
 }
 
@@ -570,15 +614,11 @@ Video: $VideoFileName
 GitHub Pagesへの反映も完了しています。
 "@
 
-    $result = & gh issue comment `
-        "$IssueNumber" `
-        --repo $GithubRepo `
-        --body $comment 2>&1
+    $result = & gh issue comment "$IssueNumber" --repo $GithubRepo --body $comment 2>&1
 
     if ($LASTEXITCODE -ne 0) {
 
-        throw `
-            "Issueへの完了コメント投稿に失敗しました: $result"
+        throw "Issueへの完了コメント投稿に失敗しました: $result"
     }
 }
 
@@ -602,15 +642,11 @@ Prompt ID: $PromptId
 Video: $VideoFileName
 "@
 
-    $result = & gh issue close `
-        "$IssueNumber" `
-        --repo $GithubRepo `
-        --comment $comment 2>&1
+    $result = & gh issue close "$IssueNumber" --repo $GithubRepo --comment $comment 2>&1
 
     if ($LASTEXITCODE -ne 0) {
 
-        throw `
-            "Issue #$IssueNumber のクローズに失敗しました: $result"
+        throw "Issue #$IssueNumber のクローズに失敗しました: $result"
     }
 }
 
@@ -708,6 +744,10 @@ function Set-RandomSeed {
 
             if ([string]$node.class_type -eq "RandomNoise") {
 
+                if ($null -eq $node.inputs) {
+                    continue
+                }
+
                 if (
                     $node.inputs.PSObject.Properties.Name `
                     -contains "noise_seed"
@@ -717,9 +757,7 @@ function Set-RandomSeed {
 
                     $found = $true
 
-                    Write-Host `
-                        "RandomNoise Seed: $Seed" `
-                        -ForegroundColor DarkGray
+                    Write-Host "RandomNoise Seed: $Seed" -ForegroundColor DarkGray
                 }
             }
         }
@@ -727,8 +765,7 @@ function Set-RandomSeed {
 
     if (!$found) {
 
-        throw `
-            "Workflow JSON内にRandomNoiseノードが見つかりません。"
+        throw "Workflow JSON内にRandomNoiseノードが見つかりません。"
     }
 }
 
@@ -740,8 +777,7 @@ function Load-Workflow {
 
     if (!(Test-Path -LiteralPath $WorkflowJson)) {
 
-        throw `
-            "Workflow JSONがありません: $WorkflowJson"
+        throw "Workflow JSONがありません: $WorkflowJson"
     }
 
     $resolvedPath = Resolve-Path $WorkflowJson
@@ -760,6 +796,73 @@ function Load-Workflow {
 }
 
 # =========================================================================
+# Placeholderカウント
+# =========================================================================
+
+function Count-Placeholder {
+    param(
+        $Object
+    )
+
+    if ($null -eq $Object) {
+        return 0
+    }
+
+    if ($Object -is [string]) {
+
+        if ($Object -eq $PromptPlaceholder) {
+            return 1
+        }
+
+        return 0
+    }
+
+    if ($Object -is [System.Collections.IList]) {
+
+        $count = 0
+
+        foreach ($item in $Object) {
+
+            if ($item -is [string]) {
+
+                if ($item -eq $PromptPlaceholder) {
+                    $count++
+                }
+            }
+            else {
+
+                $count += Count-Placeholder $item
+            }
+        }
+
+        return $count
+    }
+
+    if ($Object -is [PSCustomObject]) {
+
+        $count = 0
+
+        foreach ($property in $Object.PSObject.Properties) {
+
+            if ($property.Value -is [string]) {
+
+                if ($property.Value -eq $PromptPlaceholder) {
+                    $count++
+                }
+            }
+            else {
+
+                $count += Count-Placeholder $property.Value
+            }
+        }
+
+        return $count
+    }
+
+    return 0
+}
+
+# =========================================================================
 # Placeholder確認
 # =========================================================================
 
@@ -768,71 +871,14 @@ function Test-WorkflowPlaceholder {
         $Workflow
     )
 
-    $script:placeholderCount = 0
-
-    function Count-Placeholder {
-        param(
-            $Object
-        )
-
-        if ($null -eq $Object) {
-            return
-        }
-
-        if ($Object -is [System.Collections.IList]) {
-
-            foreach ($item in $Object) {
-
-                if ($item -is [string]) {
-
-                    if ($item -eq $PromptPlaceholder) {
-
-                        $script:placeholderCount++
-                    }
-                }
-                else {
-
-                    Count-Placeholder $item
-                }
-            }
-
-            return
-        }
-
-        if ($Object -is [PSCustomObject]) {
-
-            foreach ($property in $Object.PSObject.Properties) {
-
-                if ($property.Value -is [string]) {
-
-                    if ($property.Value -eq $PromptPlaceholder) {
-
-                        $script:placeholderCount++
-                    }
-                }
-                else {
-
-                    Count-Placeholder $property.Value
-                }
-            }
-        }
-    }
-
-    Count-Placeholder $Workflow
-
-    $count = $script:placeholderCount
-
-    $script:placeholderCount = 0
+    $count = Count-Placeholder $Workflow
 
     if ($count -ne 1) {
 
-        throw `
-            "Workflow JSON内の $PromptPlaceholder が1個ではありません。現在: $count"
+        throw "Workflow JSON内の $PromptPlaceholder が1個ではありません。現在: $count"
     }
 
-    Write-Host `
-        "Workflow placeholder OK" `
-        -ForegroundColor Green
+    Write-Host "Workflow placeholder OK" -ForegroundColor Green
 }
 
 # =========================================================================
@@ -941,9 +987,7 @@ function Find-LocalVideo {
         return $null
     }
 
-    $directPath = Join-Path `
-        $ComfyOutputDir `
-        $FileName
+    $directPath = Join-Path -Path $ComfyOutputDir -ChildPath $FileName
 
     if (Test-Path -LiteralPath $directPath) {
 
@@ -991,76 +1035,52 @@ function Copy-ComfyVideo {
 
     if ([string]::IsNullOrWhiteSpace($fileName)) {
 
-        throw `
-            "動画ファイル名を特定できません。"
+        throw "動画ファイル名を特定できません。"
     }
 
-    $localVideo =
-        Find-LocalVideo `
-            -FileName $fileName
+    $localVideo = Find-LocalVideo -FileName $fileName
 
     if ($null -eq $localVideo) {
 
-        throw `
-            "ComfyUI出力フォルダに動画が見つかりません: $fileName"
+        throw "ComfyUI出力フォルダに動画が見つかりません: $fileName"
     }
 
     if (!(Test-Path -LiteralPath $RepoVideoDir)) {
 
-        New-Item `
-            -ItemType Directory `
-            -Path $RepoVideoDir `
-            -Force |
-            Out-Null
+        New-Item -ItemType Directory -Path $RepoVideoDir -Force | Out-Null
     }
 
-    $target =
-        Join-Path `
-            $RepoVideoDir `
-            $fileName
+    $target = Join-Path -Path $RepoVideoDir -ChildPath $fileName
 
     # 同一ファイルならコピー不要
     if (Test-Path -LiteralPath $target) {
 
-        $existing = Get-Item `
-            -LiteralPath $target
+        $existing = Get-Item -LiteralPath $target
 
         if (
             $existing.Length -eq $localVideo.Length -and
             $existing.Length -gt 0
         ) {
 
-            Write-Host `
-                "動画は既にdocs/videosへ存在します。" `
-                -ForegroundColor Yellow
+            Write-Host "動画は既にdocs/videosへ存在します。" -ForegroundColor Yellow
 
             return $fileName
         }
     }
 
-    Copy-Item `
-        -LiteralPath $localVideo.FullName `
-        -Destination $target `
-        -Force
+    Copy-Item -LiteralPath $localVideo.FullName -Destination $target -Force
 
-    $targetInfo =
-        Get-Item `
-            -LiteralPath $target
+    $targetInfo = Get-Item -LiteralPath $target
 
     if ($targetInfo.Length -le 0) {
 
-        throw `
-            "コピーされた動画が0バイトです。"
+        throw "コピーされた動画が0バイトです。"
     }
 
     Write-Host ""
-    Write-Host `
-        "動画コピー完了:" `
-        -ForegroundColor Green
+    Write-Host "動画コピー完了:" -ForegroundColor Green
 
-    Write-Host `
-        $target `
-        -ForegroundColor Green
+    Write-Host $target -ForegroundColor Green
 
     return $fileName
 }
@@ -1082,20 +1102,12 @@ function Update-Pages {
 
     if (!(Test-Path -LiteralPath "docs")) {
 
-        New-Item `
-            -ItemType Directory `
-            -Path "docs" `
-            -Force |
-            Out-Null
+        New-Item -ItemType Directory -Path "docs" -Force | Out-Null
     }
 
     if (!(Test-Path -LiteralPath $RepoVideoDir)) {
 
-        New-Item `
-            -ItemType Directory `
-            -Path $RepoVideoDir `
-            -Force |
-            Out-Null
+        New-Item -ItemType Directory -Path $RepoVideoDir -Force | Out-Null
     }
 
     if (!(Test-Path -LiteralPath $PagesFile)) {
@@ -1220,8 +1232,7 @@ video {
 
     if ($html -notmatch "<!-- JOBS_START -->") {
 
-        throw `
-            "index.htmlにJOBS_STARTがありません。"
+        throw "index.htmlにJOBS_STARTがありません。"
     }
 
     # -------------------------------------------------------------
@@ -1237,9 +1248,7 @@ video {
         )
     ) {
 
-        Write-Host `
-            "このPrompt IDは既にGitHub Pagesへ登録されています。" `
-            -ForegroundColor Yellow
+        Write-Host "このPrompt IDは既にGitHub Pagesへ登録されています。" -ForegroundColor Yellow
 
         return
     }
@@ -1316,75 +1325,96 @@ $safeVideoName
         $Utf8NoBom
     )
 
-    Write-Host `
-        "GitHub Pagesのindex.htmlを更新しました。" `
-        -ForegroundColor Green
+    Write-Host "GitHub Pagesのindex.htmlを更新しました。" -ForegroundColor Green
 }
 
 # =========================================================================
 # Git Publish
 #
-# 既にpush済みなら成功扱い。
+# ★重要修正:
+#
+# gitコマンドの出力をパイプラインへ流さない。
+# 出力はすべて変数に受け取る。
+#
+# これにより Ensure-GitPublished の戻り値に
+# git出力が混ざって $State が壊れるのを防ぐ。
 # =========================================================================
 
 function Publish-Docs {
 
     Write-Host ""
-    Write-Host `
-        "GitHub Pagesへ成果物をプッシュします..." `
-        -ForegroundColor Cyan
+    Write-Host "GitHub Pagesへ成果物をプッシュします..." -ForegroundColor Cyan
 
-    git add -- docs/
+    # -----------------------------------------------------------------
+    # git add
+    # -----------------------------------------------------------------
+
+    $addOutput = git add -- docs/ 2>&1
 
     if ($LASTEXITCODE -ne 0) {
 
-        throw `
-            "git addに失敗しました。"
+        throw "git addに失敗しました。`n$($addOutput -join "`n")"
     }
 
-    git diff --cached --quiet
+    # -----------------------------------------------------------------
+    # git diff --cached --quiet
+    #
+    # 0: 変更なし
+    # 1: staged変更あり
+    # 2: gitコマンドエラー
+    # -----------------------------------------------------------------
+
+    $diffOutput = git diff --cached --quiet 2>&1
 
     $diffExitCode = $LASTEXITCODE
 
     if ($diffExitCode -eq 2) {
 
-        throw `
-            "git diff --cachedでエラーが発生しました。"
+        throw "git diff --cachedでエラーが発生しました。`n$($diffOutput -join "`n")"
     }
 
     if ($diffExitCode -eq 0) {
 
-        Write-Host `
-            "docs/に新しい変更はありません。" `
-            -ForegroundColor Yellow
+        Write-Host "docs/に新しい変更はありません。" -ForegroundColor Yellow
 
         return
     }
 
-    git commit `
-        -m "Auto-update Pages [skip ci]"
+    # -----------------------------------------------------------------
+    # git commit
+    # -----------------------------------------------------------------
+
+    $commitOutput = git commit -m "Auto-update Pages [skip ci]" 2>&1
 
     if ($LASTEXITCODE -ne 0) {
 
-        # commit済みなのにcommitが失敗した可能性を
-        # statusで確認する。
-        $status = git status --short
+        $statusOutput = git status --short 2>&1
 
-        throw `
-            "git commitに失敗しました。`n$status"
+        throw "git commitに失敗しました。`n$($commitOutput -join "`n")`n`n$($statusOutput -join "`n")"
     }
 
-    git push origin main
+    # -----------------------------------------------------------------
+    # git push
+    # -----------------------------------------------------------------
+
+    $pushOutput = git push origin main 2>&1
 
     if ($LASTEXITCODE -ne 0) {
 
-        throw `
-            "git pushに失敗しました。"
+        throw "git pushに失敗しました。`n$($pushOutput -join "`n")"
     }
 
-    Write-Host `
-        "GitHubへのpush完了。" `
-        -ForegroundColor Green
+    # -----------------------------------------------------------------
+    # 必要なら表示だけ行う。
+    # Write-Host はパイプライン戻り値にはならない。
+    # -----------------------------------------------------------------
+
+    if ($pushOutput) {
+
+        Write-Host ($pushOutput -join "`n") -ForegroundColor DarkGray
+    }
+
+    Write-Host "GitHubへのpush完了。" -ForegroundColor Green
 }
 
 # =========================================================================
@@ -1411,9 +1441,7 @@ git config --global user.email "you@example.com"
 "@
     }
 
-    Write-Host `
-        "Git user: $gitName <$gitEmail>" `
-        -ForegroundColor DarkGray
+    Write-Host "Git user: $gitName <$gitEmail>" -ForegroundColor DarkGray
 }
 
 # =========================================================================
@@ -1436,9 +1464,7 @@ $result
 "@
     }
 
-    Write-Host `
-        "GitHub CLI 接続OK" `
-        -ForegroundColor Green
+    Write-Host "GitHub CLI 接続OK" -ForegroundColor Green
 }
 
 # =========================================================================
@@ -1507,8 +1533,7 @@ function Get-OrCreateIssueState {
         )
     ) {
 
-        throw `
-            "Issue番号を整数に変換できません。"
+        throw "Issue番号を整数に変換できません。"
     }
 
     $promptText = [string]$Issue.body
@@ -1524,14 +1549,15 @@ function Get-OrCreateIssueState {
     # 1. Local State
     # -------------------------------------------------------------
 
-    $state = Load-State `
-        -IssueNumber $issueNumber
+    $state = Load-State -IssueNumber $issueNumber
 
     if ($null -ne $state) {
 
-        Write-Host `
-            "ローカルStateを復旧しました。" `
-            -ForegroundColor Green
+        Ensure-StateProperties $state
+
+        Write-Host "ローカルStateを復旧しました。" -ForegroundColor Green
+
+        Save-State $state
 
         return $state
     }
@@ -1541,8 +1567,7 @@ function Get-OrCreateIssueState {
     # -------------------------------------------------------------
 
     $githubJob =
-        Get-GitHubJobInfo `
-            -IssueNumber $issueNumber
+        Get-GitHubJobInfo -IssueNumber $issueNumber
 
     $state =
         New-IssueState `
@@ -1571,9 +1596,7 @@ function Get-OrCreateIssueState {
         )
     ) {
 
-        Write-Host `
-            "GitHubコメントからPrompt IDを復旧しました。" `
-            -ForegroundColor Yellow
+        Write-Host "GitHubコメントからPrompt IDを復旧しました。" -ForegroundColor Yellow
 
         $state.PromptId =
             $githubJob.PromptId
@@ -1626,9 +1649,7 @@ function Submit-New-ComfyJob {
     if ($State.Submitted -and
         ![string]::IsNullOrWhiteSpace($State.PromptId)) {
 
-        Write-Host `
-            "ComfyUIジョブは既に送信済みです。" `
-            -ForegroundColor Yellow
+        Write-Host "ComfyUIジョブは既に送信済みです。" -ForegroundColor Yellow
 
         return $State
     }
@@ -1653,8 +1674,7 @@ function Submit-New-ComfyJob {
 
     if ($replacementCount -ne 1) {
 
-        throw `
-            "Prompt placeholderの置換に失敗しました。置換数=$replacementCount"
+        throw "Prompt placeholderの置換に失敗しました。置換数=$replacementCount"
     }
 
     # -------------------------------------------------------------
@@ -1700,9 +1720,7 @@ function Submit-New-ComfyJob {
     # -------------------------------------------------------------
 
     Write-Host ""
-    Write-Host `
-        "ComfyUI ジョブを送信中..." `
-        -ForegroundColor Cyan
+    Write-Host "ComfyUI ジョブを送信中..." -ForegroundColor Cyan
 
     $response =
         Invoke-RestMethod `
@@ -1714,8 +1732,18 @@ function Submit-New-ComfyJob {
 
     if ($null -eq $response.prompt_id) {
 
-        throw `
-            "ComfyUIからPrompt IDが返されませんでした。"
+        if (
+            $response.PSObject.Properties.Name `
+            -contains "error"
+        ) {
+
+            $errorText =
+                $response.error | ConvertTo-Json -Depth 5
+
+            throw "ComfyUIからエラーが返されました:`n$errorText"
+        }
+
+        throw "ComfyUIからPrompt IDが返されませんでした。"
     }
 
     $State.PromptId =
@@ -1735,17 +1763,11 @@ function Submit-New-ComfyJob {
     Save-State $State
 
     Write-Host ""
-    Write-Host `
-        "ComfyUIジョブ送信成功！" `
-        -ForegroundColor Green
+    Write-Host "ComfyUIジョブ送信成功！" -ForegroundColor Green
 
-    Write-Host `
-        "Prompt ID: $($State.PromptId)" `
-        -ForegroundColor Yellow
+    Write-Host "Prompt ID: $($State.PromptId)" -ForegroundColor Yellow
 
-    Write-Host `
-        "Seed: $($State.Seed)" `
-        -ForegroundColor Yellow
+    Write-Host "Seed: $($State.Seed)" -ForegroundColor Yellow
 
     return $State
 }
@@ -1772,8 +1794,45 @@ function Ensure-JobComment {
         )
     ) {
 
-        throw `
-            "Prompt IDがありません。"
+        throw "Prompt IDがありません。"
+    }
+
+    # -------------------------------------------------------------
+    # 保険:
+    #
+    # GitHubに既にJobコメントが存在する場合は、
+    # StateだけJobCommented=trueにする。
+    #
+    # 重複コメントを防ぐ。
+    # -------------------------------------------------------------
+
+    try {
+
+        $comments = Get-IssueComments -IssueNumber ([int]$State.IssueNumber)
+
+        foreach ($comment in @($comments)) {
+
+            if ($null -eq $comment) {
+                continue
+            }
+
+            $body = [string]$comment.body
+
+            if ($body.Contains($JobMarker)) {
+
+                $State.JobCommented = $true
+
+                Save-State $State
+
+                Write-Host "GitHubに既にJobコメントが存在するため、状態だけ更新しました。" -ForegroundColor Yellow
+
+                return
+            }
+        }
+    }
+    catch {
+
+        # 取得失敗は致命エラーにしない。
     }
 
     try {
@@ -1787,9 +1846,7 @@ function Ensure-JobComment {
 
         Save-State $State
 
-        Write-Host `
-            "GitHubへJob情報を記録しました。" `
-            -ForegroundColor Green
+        Write-Host "GitHubへJob情報を記録しました。" -ForegroundColor Green
     }
     catch {
 
@@ -1802,22 +1859,14 @@ function Ensure-JobComment {
         # -------------------------------------------------------------
 
         Write-Host ""
-        Write-Host `
-            "GitHubへのJobコメント保存に失敗しました。" `
-            -ForegroundColor Yellow
+        Write-Host "GitHubへのJobコメント保存に失敗しました。" -ForegroundColor Yellow
 
-        Write-Host `
-            $_ `
-            -ForegroundColor Yellow
+        Write-Host $_ -ForegroundColor Yellow
 
         Write-Host ""
-        Write-Host `
-            "ComfyUIジョブ自体は送信済みとして保持します。" `
-            -ForegroundColor Green
+        Write-Host "ComfyUIジョブ自体は送信済みとして保持します。" -ForegroundColor Green
 
-        Write-Host `
-            "次回ループでJobコメントのみ再試行します。" `
-            -ForegroundColor Green
+        Write-Host "次回ループでJobコメントのみ再試行します。" -ForegroundColor Green
     }
 }
 
@@ -1832,9 +1881,7 @@ function Ensure-Generated {
 
     if ($State.Generated) {
 
-        Write-Host `
-            "生成済み動画情報をStateから復旧しました。" `
-            -ForegroundColor Green
+        Write-Host "生成済み動画情報をStateから復旧しました。" -ForegroundColor Green
 
         return $State
     }
@@ -1845,14 +1892,11 @@ function Ensure-Generated {
         )
     ) {
 
-        throw `
-            "Prompt IDがありません。"
+        throw "Prompt IDがありません。"
     }
 
     Write-Host ""
-    Write-Host `
-        "動画生成状態を確認します。" `
-        -ForegroundColor Cyan
+    Write-Host "動画生成状態を確認します。" -ForegroundColor Cyan
 
     $startTime = Get-Date
 
@@ -1869,25 +1913,21 @@ function Ensure-Generated {
             )
 
         Write-Host ""
-        Write-Host `
-            "[$minutes 分経過] ComfyUI History確認中..." `
-            -ForegroundColor Cyan
+        Write-Host "[$minutes 分経過] ComfyUI History確認中..." -ForegroundColor Cyan
+
+        $promptId = [string]$State.PromptId
 
         $historyResponse =
-            Get-ComfyHistory `
-                -PromptId ([string]$State.PromptId)
+            Get-ComfyHistory -PromptId $promptId
 
         if ($null -ne $historyResponse) {
 
             if (
                 $historyResponse.PSObject.Properties.Name `
-                -contains $State.PromptId
+                -contains $promptId
             ) {
 
-                $history =
-                    $historyResponse.$(
-                        [string]$State.PromptId
-                    )
+                $history = $historyResponse.$promptId
 
                 # -----------------------------------------------------
                 # Status
@@ -1906,17 +1946,14 @@ function Ensure-Generated {
                         $status =
                             [string]$history.status.status_str
 
-                        Write-Host `
-                            "Status: $status" `
-                            -ForegroundColor DarkGray
+                        Write-Host "Status: $status" -ForegroundColor DarkGray
 
                         if (
                             $status -match
                             '(?i)error|failed'
                         ) {
 
-                            throw `
-                                "ComfyUIジョブが失敗しました。Status=$status"
+                            throw "ComfyUIジョブが失敗しました。Status=$status"
                         }
                     }
                 }
@@ -1926,8 +1963,7 @@ function Ensure-Generated {
                 # -----------------------------------------------------
 
                 $videoOutput =
-                    Get-VideoOutputFromHistory `
-                        -History $history
+                    Get-VideoOutputFromHistory -History $history
 
                 if ($null -ne $videoOutput) {
 
@@ -1947,9 +1983,7 @@ function Ensure-Generated {
                     Save-State $State
 
                     Write-Host ""
-                    Write-Host `
-                        "動画生成完了！" `
-                        -ForegroundColor Green
+                    Write-Host "動画生成完了！" -ForegroundColor Green
 
                     return $State
                 }
@@ -1958,16 +1992,12 @@ function Ensure-Generated {
 
         if ($elapsed -ge $MaxWaitSeconds) {
 
-            throw `
-                "最大待機時間60分を超えました。Prompt ID=$($State.PromptId)"
+            throw "最大待機時間60分を超えました。Prompt ID=$($State.PromptId)"
         }
 
-        Write-Host `
-            "まだ生成中です。1分後に再確認します。" `
-            -ForegroundColor DarkGray
+        Write-Host "まだ生成中です。1分後に再確認します。" -ForegroundColor DarkGray
 
-        Start-Sleep `
-            -Seconds $CheckIntervalSeconds
+        Start-Sleep -Seconds $CheckIntervalSeconds
     }
 }
 
@@ -1989,9 +2019,7 @@ function Ensure-VideoCopied {
 
         if (Test-Path -LiteralPath $target) {
 
-            Write-Host `
-                "動画コピー済みです。" `
-                -ForegroundColor Green
+            Write-Host "動画コピー済みです。" -ForegroundColor Green
 
             return $State
         }
@@ -2006,8 +2034,7 @@ function Ensure-VideoCopied {
         )
     ) {
 
-        throw `
-            "VideoFileNameがありません。"
+        throw "VideoFileNameがありません。"
     }
 
     $videoOutput =
@@ -2062,9 +2089,7 @@ function Ensure-PagesUpdated {
                 )
             ) {
 
-                Write-Host `
-                    "GitHub Pages更新済みです。" `
-                    -ForegroundColor Green
+                Write-Host "GitHub Pages更新済みです。" -ForegroundColor Green
 
                 return $State
             }
@@ -2097,14 +2122,19 @@ function Ensure-GitPublished {
 
     if ($State.GitPublished) {
 
-        Write-Host `
-            "GitHub Pagesは既にpush済みです。" `
-            -ForegroundColor Green
+        Write-Host "GitHub Pagesは既にpush済みです。" -ForegroundColor Green
 
         return $State
     }
 
-    Publish-Docs
+    # -------------------------------------------------------------
+    # ★重要:
+    #
+    # Publish-Docsの出力をパイプラインに流さない。
+    # これにより $State が配列になるバグを防ぐ。
+    # -------------------------------------------------------------
+
+    $null = Publish-Docs
 
     # -------------------------------------------------------------
     # push成功後のみtrue
@@ -2126,6 +2156,75 @@ function Ensure-Completed {
         $State
     )
 
+    # -------------------------------------------------------------
+    # 保険:
+    #
+    # 過去バグで $State が配列になっている場合がある。
+    # 配列なら PSCustomObject だけを取り出す。
+    # -------------------------------------------------------------
+
+    if ($State -is [array]) {
+
+        $State =
+            $State |
+            Where-Object {
+                $_ -is [pscustomobject]
+            } |
+            Select-Object -First 1
+    }
+
+    if ($null -eq $State) {
+
+        return $null
+    }
+
+    Ensure-StateProperties $State
+
+    # -------------------------------------------------------------
+    # 保険:
+    #
+    # GitHubに既に完了コメントが存在する場合は、
+    # StateだけCompletedCommented=trueにする。
+    #
+    # 重複完了コメントを防ぐ。
+    # -------------------------------------------------------------
+
+    if (!$State.CompletedCommented) {
+
+        try {
+
+            $comments = Get-IssueComments -IssueNumber ([int]$State.IssueNumber)
+
+            foreach ($comment in @($comments)) {
+
+                if ($null -eq $comment) {
+                    continue
+                }
+
+                $body = [string]$comment.body
+
+                if ($body.Contains($SuccessMarker)) {
+
+                    $State.CompletedCommented = $true
+
+                    Save-State $State
+
+                    Write-Host "GitHubに既に完了コメントが存在するため、状態だけ更新しました。" -ForegroundColor Yellow
+
+                    break
+                }
+            }
+        }
+        catch {
+
+            # 取得失敗は致命エラーにしない。
+        }
+    }
+
+    # -------------------------------------------------------------
+    # CompletedCommented
+    # -------------------------------------------------------------
+
     if (!$State.CompletedCommented) {
 
         try {
@@ -2139,24 +2238,16 @@ function Ensure-Completed {
 
             Save-State $State
 
-            Write-Host `
-                "完了コメントを投稿しました。" `
-                -ForegroundColor Green
+            Write-Host "完了コメントを投稿しました。" -ForegroundColor Green
         }
         catch {
 
             Write-Host ""
-            Write-Host `
-                "完了コメント投稿に失敗しました。" `
-                -ForegroundColor Yellow
+            Write-Host "完了コメント投稿に失敗しました。" -ForegroundColor Yellow
 
-            Write-Host `
-                $_ `
-                -ForegroundColor Yellow
+            Write-Host $_ -ForegroundColor Yellow
 
-            Write-Host `
-                "次回ループで再試行します。" `
-                -ForegroundColor Yellow
+            Write-Host "次回ループで再試行します。" -ForegroundColor Yellow
 
             return $State
         }
@@ -2184,24 +2275,33 @@ function Ensure-Completed {
 
             Save-State $State
 
-            Write-Host `
-                "IssueをCloseしました。" `
-                -ForegroundColor Green
+            Write-Host "IssueをCloseしました。" -ForegroundColor Green
         }
         catch {
 
-            Write-Host ""
-            Write-Host `
-                "Issue Closeに失敗しました。" `
-                -ForegroundColor Yellow
+            $err = $_.Exception.Message
 
-            Write-Host `
-                $_ `
-                -ForegroundColor Yellow
+            # ---------------------------------------------------------
+            # 既にcloseされている場合はClosed=trueとして扱う
+            # ---------------------------------------------------------
 
-            Write-Host `
-                "次回ループで再試行します。" `
-                -ForegroundColor Yellow
+            if ($err -match '(?i)already closed') {
+
+                $State.Closed = $true
+
+                Save-State $State
+
+                Write-Host "Issueは既にCloseされているため、状態だけClosed=trueにしました。" -ForegroundColor Yellow
+            }
+            else {
+
+                Write-Host ""
+                Write-Host "Issue Closeに失敗しました。" -ForegroundColor Yellow
+
+                Write-Host $_ -ForegroundColor Yellow
+
+                Write-Host "次回ループで再試行します。" -ForegroundColor Yellow
+            }
         }
     }
 
@@ -2228,30 +2328,45 @@ function Process-Issue {
         )
     ) {
 
-        throw `
-            "Issue番号を整数に変換できません。"
+        throw "Issue番号を整数に変換できません。"
     }
 
     Write-Host ""
-    Write-Host `
-        "----------------------------------------" `
-        -ForegroundColor Gray
+    Write-Host "----------------------------------------" -ForegroundColor Gray
 
-    Write-Host `
-        "Processing Issue #$issueNumber : $($Issue.title)" `
-        -ForegroundColor Magenta
+    Write-Host "Processing Issue #$issueNumber : $($Issue.title)" -ForegroundColor Magenta
 
-    Write-Host `
-        "----------------------------------------" `
-        -ForegroundColor Gray
+    Write-Host "----------------------------------------" -ForegroundColor Gray
 
     # -------------------------------------------------------------
     # State復旧 / 作成
     # -------------------------------------------------------------
 
     $State =
-        Get-OrCreateIssueState `
-            -Issue $Issue
+        Get-OrCreateIssueState -Issue $Issue
+
+    # -------------------------------------------------------------
+    # 保険
+    # -------------------------------------------------------------
+
+    if ($State -is [array]) {
+
+        $State =
+            $State |
+            Where-Object {
+                $_ -is [pscustomobject]
+            } |
+            Select-Object -First 1
+    }
+
+    if ($null -eq $State) {
+
+        Write-Host "Stateを取得できませんでした。" -ForegroundColor Red
+
+        return
+    }
+
+    Ensure-StateProperties $State
 
     # -------------------------------------------------------------
     # 既にClose済み
@@ -2259,9 +2374,7 @@ function Process-Issue {
 
     if ($State.Closed) {
 
-        Write-Host `
-            "State上では既に完了済みです。" `
-            -ForegroundColor Green
+        Write-Host "State上では既に完了済みです。" -ForegroundColor Green
 
         return
     }
@@ -2271,24 +2384,18 @@ function Process-Issue {
     # -------------------------------------------------------------
 
     Write-Host ""
-    Write-Host `
-        "Prompt:" `
-        -ForegroundColor DarkGray
+    Write-Host "Prompt:" -ForegroundColor DarkGray
 
     if ($State.Prompt.Length -gt 500) {
 
-        Write-Host `
-            (
-                $State.Prompt.Substring(0,500) +
-                "..."
-            ) `
-            -ForegroundColor White
+        Write-Host (
+            $State.Prompt.Substring(0,500) +
+            "..."
+        ) -ForegroundColor White
     }
     else {
 
-        Write-Host `
-            $State.Prompt `
-            -ForegroundColor White
+        Write-Host $State.Prompt -ForegroundColor White
     }
 
     # =============================================================
@@ -2311,17 +2418,11 @@ function Process-Issue {
     else {
 
         Write-Host ""
-        Write-Host `
-            "既存ComfyUIジョブを使用します。" `
-            -ForegroundColor Yellow
+        Write-Host "既存ComfyUIジョブを使用します。" -ForegroundColor Yellow
 
-        Write-Host `
-            "Prompt ID: $($State.PromptId)" `
-            -ForegroundColor Yellow
+        Write-Host "Prompt ID: $($State.PromptId)" -ForegroundColor Yellow
 
-        Write-Host `
-            "再送信は行いません。" `
-            -ForegroundColor Green
+        Write-Host "再送信は行いません。" -ForegroundColor Green
     }
 
     # =============================================================
@@ -2329,8 +2430,7 @@ function Process-Issue {
     # GitHub Job Comment
     # =============================================================
 
-    Ensure-JobComment `
-        -State $State
+    Ensure-JobComment -State $State
 
     # =============================================================
     # Phase 3
@@ -2338,8 +2438,7 @@ function Process-Issue {
     # =============================================================
 
     $State =
-        Ensure-Generated `
-            -State $State
+        Ensure-Generated -State $State
 
     # =============================================================
     # Phase 4
@@ -2347,8 +2446,7 @@ function Process-Issue {
     # =============================================================
 
     $State =
-        Ensure-VideoCopied `
-            -State $State
+        Ensure-VideoCopied -State $State
 
     # =============================================================
     # Phase 5
@@ -2356,8 +2454,7 @@ function Process-Issue {
     # =============================================================
 
     $State =
-        Ensure-PagesUpdated `
-            -State $State
+        Ensure-PagesUpdated -State $State
 
     # =============================================================
     # Phase 6
@@ -2365,8 +2462,7 @@ function Process-Issue {
     # =============================================================
 
     $State =
-        Ensure-GitPublished `
-            -State $State
+        Ensure-GitPublished -State $State
 
     # =============================================================
     # Phase 7
@@ -2374,8 +2470,7 @@ function Process-Issue {
     # =============================================================
 
     $State =
-        Ensure-Completed `
-            -State $State
+        Ensure-Completed -State $State
 
     # -------------------------------------------------------------
     # Final
@@ -2384,36 +2479,22 @@ function Process-Issue {
     if ($State.Closed) {
 
         Write-Host ""
-        Write-Host `
-            "========================================" `
-            -ForegroundColor Green
+        Write-Host "========================================" -ForegroundColor Green
 
-        Write-Host `
-            "Issue #$issueNumber 完全完了" `
-            -ForegroundColor Green
+        Write-Host "Issue #$issueNumber 完全完了" -ForegroundColor Green
 
-        Write-Host `
-            "Prompt ID: $($State.PromptId)" `
-            -ForegroundColor Green
+        Write-Host "Prompt ID: $($State.PromptId)" -ForegroundColor Green
 
-        Write-Host `
-            "Video: $($State.VideoFileName)" `
-            -ForegroundColor Green
+        Write-Host "Video: $($State.VideoFileName)" -ForegroundColor Green
 
-        Write-Host `
-            "========================================" `
-            -ForegroundColor Green
+        Write-Host "========================================" -ForegroundColor Green
     }
     else {
 
         Write-Host ""
-        Write-Host `
-            "Issue #$issueNumber は処理途中です。" `
-            -ForegroundColor Yellow
+        Write-Host "Issue #$issueNumber は処理途中です。" -ForegroundColor Yellow
 
-        Write-Host `
-            "次回ループでStateから再開します。" `
-            -ForegroundColor Yellow
+        Write-Host "次回ループでStateから再開します。" -ForegroundColor Yellow
     }
 }
 
@@ -2424,9 +2505,7 @@ function Process-Issue {
 function Test-InitialEnvironment {
 
     Write-Host ""
-    Write-Host `
-        "初期チェック中..." `
-        -ForegroundColor Cyan
+    Write-Host "初期チェック中..." -ForegroundColor Cyan
 
     # -------------------------------------------------------------
     # State
@@ -2434,9 +2513,7 @@ function Test-InitialEnvironment {
 
     Ensure-StateDirectory
 
-    Write-Host `
-        "State directory OK: $StateDir" `
-        -ForegroundColor Green
+    Write-Host "State directory OK: $StateDir" -ForegroundColor Green
 
     # -------------------------------------------------------------
     # Comfy output
@@ -2444,8 +2521,7 @@ function Test-InitialEnvironment {
 
     if (!(Test-Path -LiteralPath $ComfyOutputDir)) {
 
-        throw `
-            "ComfyUI出力フォルダがありません: $ComfyOutputDir"
+        throw "ComfyUI出力フォルダがありません: $ComfyOutputDir"
     }
 
     # -------------------------------------------------------------
@@ -2472,14 +2548,11 @@ function Test-InitialEnvironment {
             -ErrorAction Stop |
             Out-Null
 
-        Write-Host `
-            "ComfyUI 接続OK" `
-            -ForegroundColor Green
+        Write-Host "ComfyUI 接続OK" -ForegroundColor Green
     }
     catch {
 
-        throw `
-            "ComfyUIに接続できません: $ComfyUrl"
+        throw "ComfyUIに接続できません: $ComfyUrl"
     }
 
     # -------------------------------------------------------------
@@ -2489,13 +2562,10 @@ function Test-InitialEnvironment {
     $baseWorkflow =
         Load-Workflow
 
-    Test-WorkflowPlaceholder `
-        -Workflow $baseWorkflow.Object
+    Test-WorkflowPlaceholder -Workflow $baseWorkflow.Object
 
     Write-Host ""
-    Write-Host `
-        "初期チェック完了。" `
-        -ForegroundColor Green
+    Write-Host "初期チェック完了。" -ForegroundColor Green
 
     return $baseWorkflow
 }
@@ -2504,30 +2574,19 @@ function Test-InitialEnvironment {
 # 起動
 # =========================================================================
 
-Write-Section `
-    "GitHub Issue → ComfyUI → Video → GitHub Pages 完全復旧版"
+Write-Section "GitHub Issue -> ComfyUI -> Video -> GitHub Pages 完全復旧版"
 
 Write-Host ""
-Write-Host `
-    "Workflow : $WorkflowJson" `
-    -ForegroundColor DarkGray
+Write-Host "Workflow : $WorkflowJson" -ForegroundColor DarkGray
 
-Write-Host `
-    "State    : $StateDir" `
-    -ForegroundColor DarkGray
+Write-Host "State    : $StateDir" -ForegroundColor DarkGray
 
-Write-Host `
-    "Issue確認: $LoopIntervalSeconds 秒ごと" `
-    -ForegroundColor DarkGray
+Write-Host "Issue確認: $LoopIntervalSeconds 秒ごと" -ForegroundColor DarkGray
 
-Write-Host `
-    "生成待機 : 最大60分" `
-    -ForegroundColor DarkGray
+Write-Host "生成待機 : 最大60分" -ForegroundColor DarkGray
 
 Write-Host ""
-Write-Host `
-    "Ctrl+C で終了します。" `
-    -ForegroundColor Yellow
+Write-Host "Ctrl+C で終了します。" -ForegroundColor Yellow
 
 # =========================================================================
 # 初期チェック
@@ -2541,13 +2600,9 @@ try {
 catch {
 
     Write-Host ""
-    Write-Host `
-        "初期チェック失敗。" `
-        -ForegroundColor Red
+    Write-Host "初期チェック失敗。" -ForegroundColor Red
 
-    Write-Host `
-        $_ `
-        -ForegroundColor Red
+    Write-Host $_ -ForegroundColor Red
 
     exit 1
 }
@@ -2560,12 +2615,9 @@ while ($true) {
 
     try {
 
-        Write-Section `
-            "GitHub Issue確認"
+        Write-Section "GitHub Issue確認"
 
-        Write-Host `
-            "Open Issueを確認しています..." `
-            -ForegroundColor Cyan
+        Write-Host "Open Issueを確認しています..." -ForegroundColor Cyan
 
         $issues =
             Get-OpenIssues
@@ -2579,15 +2631,11 @@ while ($true) {
 
         if ($issues.Count -eq 0) {
 
-            Write-Host `
-                "処理対象のIssueはありません。" `
-                -ForegroundColor Green
+            Write-Host "処理対象のIssueはありません。" -ForegroundColor Green
         }
         else {
 
-            Write-Host `
-                "$($issues.Count) 件のOpen Issueを検出しました。" `
-                -ForegroundColor Cyan
+            Write-Host "$($issues.Count) 件のOpen Issueを検出しました。" -ForegroundColor Cyan
 
             foreach ($issue in $issues) {
 
@@ -2600,32 +2648,20 @@ while ($true) {
                 catch {
 
                     Write-Host ""
-                    Write-Host `
-                        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" `
-                        -ForegroundColor Red
+                    Write-Host "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" -ForegroundColor Red
 
-                    Write-Host `
-                        "Issue #$($issue.number) の処理に失敗しました。" `
-                        -ForegroundColor Red
+                    Write-Host "Issue #$($issue.number) の処理に失敗しました。" -ForegroundColor Red
 
                     Write-Host ""
 
-                    Write-Host `
-                        $_ `
-                        -ForegroundColor Red
+                    Write-Host $_ -ForegroundColor Red
 
                     Write-Host ""
-                    Write-Host `
-                        "Issueはクローズしません。" `
-                        -ForegroundColor Yellow
+                    Write-Host "Issueはクローズしません。" -ForegroundColor Yellow
 
-                    Write-Host `
-                        "Stateが残っているため、次回は途中から再開します。" `
-                        -ForegroundColor Yellow
+                    Write-Host "Stateが残っているため、次回は途中から再開します。" -ForegroundColor Yellow
 
-                    Write-Host `
-                        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" `
-                        -ForegroundColor Red
+                    Write-Host "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" -ForegroundColor Red
 
                     continue
                 }
@@ -2633,45 +2669,29 @@ while ($true) {
         }
 
         Write-Host ""
-        Write-Host `
-            "今回のIssueチェックが終了しました。" `
-            -ForegroundColor Green
+        Write-Host "今回のIssueチェックが終了しました。" -ForegroundColor Green
 
         Write-Host ""
-        Write-Host `
-            "次回GitHub確認まで $LoopIntervalSeconds 秒待機します。" `
-            -ForegroundColor DarkGray
+        Write-Host "次回GitHub確認まで $LoopIntervalSeconds 秒待機します。" -ForegroundColor DarkGray
 
-        Start-Sleep `
-            -Seconds $LoopIntervalSeconds
+        Start-Sleep -Seconds $LoopIntervalSeconds
     }
     catch {
 
         Write-Host ""
-        Write-Host `
-            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" `
-            -ForegroundColor Red
+        Write-Host "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" -ForegroundColor Red
 
-        Write-Host `
-            "メインループでエラーが発生しました。" `
-            -ForegroundColor Red
+        Write-Host "メインループでエラーが発生しました。" -ForegroundColor Red
 
         Write-Host ""
 
-        Write-Host `
-            $_ `
-            -ForegroundColor Red
+        Write-Host $_ -ForegroundColor Red
 
         Write-Host ""
-        Write-Host `
-            "$LoopIntervalSeconds 秒後に再試行します。" `
-            -ForegroundColor Yellow
+        Write-Host "$LoopIntervalSeconds 秒後に再試行します。" -ForegroundColor Yellow
 
-        Write-Host `
-            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" `
-            -ForegroundColor Red
+        Write-Host "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" -ForegroundColor Red
 
-        Start-Sleep `
-            -Seconds $LoopIntervalSeconds
+        Start-Sleep -Seconds $LoopIntervalSeconds
     }
 }
