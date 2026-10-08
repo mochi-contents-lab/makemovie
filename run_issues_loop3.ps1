@@ -75,7 +75,7 @@ $StateDir = ".automation-state"
 
 $IssueLimit = 10
 
-$CheckIntervalSeconds = 300
+$CheckIntervalSeconds = 80
 
 $MaxWaitSeconds = 3600
 
@@ -1963,7 +1963,7 @@ function Ensure-Generated {
         }
 
         Write-Host `
-            "まだ生成中です。5分後に再確認します。" `
+            "まだ生成中です。1分後に再確認します。" `
             -ForegroundColor DarkGray
 
         Start-Sleep `
